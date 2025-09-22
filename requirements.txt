@@ -6,3 +6,11 @@ notebook
 paddlepaddle==2.6.1
 paddleocr>=2.7.0
 
+# API server
+fastapi
+uvicorn[standard]
+transformers>=4.43.0
+torch
+accelerate
+safetensors
+
