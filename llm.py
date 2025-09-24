@@ -5,8 +5,19 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 from model import ensure_invoice_shape, read_json_str, deep_coerce
 import json
+
+
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"          # better stack traces
+os.environ["PYTORCH_CUDA_USE_FLASH_SDP"] = "0"     # force non-flash SDPA
+
+
+import torch
+from torch.backends.cuda import sdp_kernel
+# Turn off flash; keep mem-efficient or math:
+sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False)
 
 
 class GenerateResponse(BaseModel):
@@ -140,23 +151,28 @@ OUTPUT
 Return EXACTLY one JSON object that matches the schema and constraints above. No extra text before or after the JSON.
 """
 
-# Lazy model/processor loading to allow server to boot without heavy downloads
-model = None
-processor = None
-
 def get_model_and_processor():
-    global model, processor
-    if model is None or processor is None:
-        loaded_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype="auto",
-            device_map="auto",
-        )
-        loaded_processor = AutoProcessor.from_pretrained(model_name)
-        model = loaded_model
-        processor = loaded_processor
+    dtype = torch.float16  # A40 is fine with fp16; bf16 ok if supported
+
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        device_map="balanced",               # or "auto"
+        attn_implementation="eager",         # critical to avoid FA/SDPA asserts
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        max_memory={i: "40GiB" for i in range(torch.cuda.device_count())},
+    ).eval()
+
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    tok = processor.tokenizer
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    model.generation_config.pad_token_id = tok.pad_token_id
+    model.generation_config.eos_token_id = tok.eos_token_id
     return model, processor
 
+model, processor = get_model_and_processor()
 
 def _normalize_image_mode(img: Image.Image) -> Image.Image:
     """Convert image to RGB, correctly handling transparency/palette to avoid warnings."""
@@ -187,55 +203,31 @@ def _decode_image_bytes(raw: bytes) -> Optional[Image.Image]:
         return None
 
 
-def _build_messages_for_image(img: Image.Image) -> Tuple[List[dict], List[Image.Image]]:
-    norm = _normalize_image_mode(img)
-    msgs: List[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": "Extract the invoice and return EXACTLY ONE JSON object as specified above. Output JSON ONLY."},
-            ],
-        },
-    ]
-    return msgs, [norm]
-
-
-def _process_vision_info(messages: List[Any]) -> Tuple[List[Image.Image], List[Any]]:
-    # Unused in image-only flow; keep for compatibility
-    return [], []
-
-
 def generate_response_from_image(img: Image.Image, max_new_tokens: int) -> str:
-    m, p = get_model_and_processor()
-    msgs, image_inputs = _build_messages_for_image(img)
-    text = p.apply_chat_template(
-        msgs,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    proc_kwargs: dict = {
-        "text": [text],
-        "padding": True,
-        "return_tensors": "pt",
-        "images": image_inputs,
-    }
-    model_inputs = p(**proc_kwargs)
-    model_inputs = model_inputs.to(m.device)
-    generated_ids = m.generate(
-        **model_inputs,
-        max_new_tokens=max_new_tokens,
-    )
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-    response_text = p.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0]
-    return response_text
+    global model, processor
+    messages = [{
+        "role": "user",
+        "content": [{"type": "image", "image": img},
+                    {"type": "text", "text": SYSTEM_PROMPT}],
+    }]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+
+    # With device_map="auto", sending inputs to the model’s first device is fine:
+    inputs = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            use_cache=True,
+        )
+    trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], out)]
+    return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
 
 app = FastAPI(title="LLM Service", version="1.0.0")
