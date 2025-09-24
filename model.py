@@ -36,40 +36,41 @@ except Exception:
 # --------------------------
 # Models (STRICT: extra=forbid)
 # --------------------------
-def forbid_config():
-    if V2:
-        return {"model_config": ConfigDict(extra="forbid")}
-    class _Cfg:  # v1
-        extra = "forbid"
-    return {"Config": _Cfg}
+if V2:
+    class StrictBaseModel(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+else:
+    class StrictBaseModel(BaseModel):
+        class Config:
+            extra = "forbid"
 
-class Contact(BaseModel, **forbid_config()):
+class Contact(StrictBaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
 
-class Vendor(BaseModel, **forbid_config()):
+class Vendor(StrictBaseModel):
     name: str
     address: Optional[str] = None
     tax_id: Optional[str] = None
     contact: Optional[Contact] = None
 
-class BillTo(BaseModel, **forbid_config()):
+class BillTo(StrictBaseModel):
     name: str
     project_name: Optional[str] = None
     project_number: Optional[str] = None
     job_site_address: Optional[str] = None
 
-class Tax(BaseModel, **forbid_config()):
+class Tax(StrictBaseModel):
     name: str
     rate: float  # e.g., 0.06
     amount: float
 
-class Adjustment(BaseModel, **forbid_config()):
+class Adjustment(StrictBaseModel):
     type: Literal["credit", "debit", "discount", "other"] = "other"
     description: str
     amount: float
 
-class LineItem(BaseModel, **forbid_config()):
+class LineItem(StrictBaseModel):
     line_id: int
     description: str
     quantity: float
@@ -80,11 +81,11 @@ class LineItem(BaseModel, **forbid_config()):
     category: Optional[Literal["material", "labor", "equipment", "subcontractor"]] = None
     taxable: Optional[bool] = None
 
-class Retainage(BaseModel, **forbid_config()):
+class Retainage(StrictBaseModel):
     percent: Optional[float] = None  # e.g., 0.10
     amount: Optional[float] = None
 
-class Invoice(BaseModel, **forbid_config()):
+class Invoice(StrictBaseModel):
     invoice_id: str
     invoice_date: str
     due_date: Optional[str] = None
